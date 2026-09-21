@@ -1,0 +1,21 @@
+[project]
+name = "agent-workforce"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Notley1608", email = "oscarnotley@hotmail.co.uk" }
+]
+requires-python = ">=3.14"
+dependencies = [
+    "fastapi>=0.141.1",
+    "groq>=1.7.0",
+    "uvicorn[standard]>=0.53.0",
+]
+
+[project.scripts]
+agent-workforce = "agent_workforce:main"
+
+[build-system]
+requires = ["uv_build>=0.12.15,<0.13.0"]
+build-backend = "uv_build"

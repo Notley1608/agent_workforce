@@ -3,7 +3,15 @@ import { Dialog } from "../../components/Dialog";
 import { useApprovePlan, useRejectPlan } from "../../lib/api/plans";
 import type { Plan } from "../../lib/schemas/plan";
 
-export function PlanReviewDialog({ plan, onOpenChange }: { plan: Plan | null; onOpenChange: (open: boolean) => void }) {
+export function PlanReviewDialog({
+  plan,
+  onOpenChange,
+  onApproved,
+}: {
+  plan: Plan | null;
+  onOpenChange: (open: boolean) => void;
+  onApproved?: (result: { workflow_id: string; run_id: string }) => void;
+}) {
   const approvePlan = useApprovePlan();
   const rejectPlan = useRejectPlan();
   if (!plan) return null;
@@ -36,7 +44,16 @@ export function PlanReviewDialog({ plan, onOpenChange }: { plan: Plan | null; on
             >
               Reject
             </Button>
-            <Button onClick={() => approvePlan.mutate(plan.id, { onSuccess: () => onOpenChange(false) })}>
+            <Button
+              onClick={() =>
+                approvePlan.mutate(plan.id, {
+                  onSuccess: (result) => {
+                    onOpenChange(false);
+                    onApproved?.(result);
+                  },
+                })
+              }
+            >
               Approve
             </Button>
           </div>

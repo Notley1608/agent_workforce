@@ -1,7 +1,13 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { z } from "zod";
 import { apiGet, apiPost } from "./client";
-import { infrastructureItemSchema, usageSchema, settingsSchema, activityEventSchema } from "../schemas/workspace";
+import {
+  infrastructureItemSchema,
+  usageSchema,
+  settingsSchema,
+  activityEventSchema,
+  orchestratorMessageSchema,
+} from "../schemas/workspace";
 
 export function useInfrastructure() {
   return useQuery({
@@ -38,6 +44,21 @@ export function useSettings() {
   return useQuery({
     queryKey: ["settings"],
     queryFn: () => apiGet("/settings", settingsSchema),
+  });
+}
+
+export function useOrchestratorMessages() {
+  return useQuery({
+    queryKey: ["orchestrator", "messages"],
+    queryFn: () => apiGet("/orchestrator/messages", z.array(orchestratorMessageSchema)),
+  });
+}
+
+export function useAskOrchestrator() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (question: string) => apiPost("/orchestrator/ask", z.object({ answer: z.string() }), { question }),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["orchestrator", "messages"] }),
   });
 }
 

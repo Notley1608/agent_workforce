@@ -41,6 +41,24 @@ class WorkforceBlockedError(Exception):
     Emergency Stop) is blocking it - see ensure_can_start_work."""
 
 
+# ponytail: fixed headcount to start, not a settings-table value - turn this
+# into a configurable setting (like daily_spend_limit) if the owner wants to
+# tune it live instead of editing code.
+MAX_AGENTS = 20
+
+
+def ensure_can_recruit_agent(conn, count: int = 1) -> None:
+    """Recruiting is free to ask for but not free to run - every agent is a
+    standing option to spend tokens/money on schedule or on a whim. Call
+    before inserting any new agent row(s), whether one at a time (manual
+    recruit) or several at once (a mission's plan)."""
+    current = conn.execute("SELECT COUNT(*) AS n FROM agents").fetchone()["n"]
+    if current + count > MAX_AGENTS:
+        raise WorkforceBlockedError(
+            f"agent cap reached ({MAX_AGENTS}); retire an existing agent before recruiting another"
+        )
+
+
 def balance(conn) -> float:
     row = conn.execute(
         "SELECT COALESCE(SUM(CASE WHEN kind = 'cost' THEN -amount ELSE amount END), 0) AS bal FROM ledger"

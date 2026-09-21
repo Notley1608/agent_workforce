@@ -584,6 +584,16 @@ class PlannerTest(unittest.TestCase):
         self.assertEqual(len(agents_after), 1)
         self.assertEqual(agents_after[0]["role"], "Researcher")
 
+    def test_agent_cap_blocks_a_mission_that_would_exceed_it(self):
+        step = {"name": "X", "role": "Researcher", "provider": "groq", "instructions": ""}
+        providers.PROVIDERS["groq"] = lambda model, system, prompt, capabilities: _fake_plan_response([step, step])
+        plan = client.post("/api/plans", json={"objective": "Do two things"}).json()
+        with patch.object(opportunities, "MAX_AGENTS", 1):
+            approval = client.post(f"/api/plans/{plan['id']}/approve")
+        self.assertEqual(approval.status_code, 403)
+        self.assertEqual(client.get("/api/agents").json(), [])
+        self.assertEqual(client.get("/api/plans").json()[0]["status"], "proposed")
+
     def test_cannot_approve_a_plan_twice(self):
         step = {"name": "X", "role": "Researcher", "provider": "groq", "instructions": ""}
         providers.PROVIDERS["groq"] = lambda model, system, prompt, capabilities: _fake_plan_response([step])
@@ -845,6 +855,14 @@ class OpportunitiesTest(unittest.TestCase):
             json={"name": "Digger", "role": "Researcher", "role_type": "researcher", "capabilities_override": ["web"]},
         ).json()
         self.assertEqual(json.loads(agent["capabilities_override"]), ["web"])
+
+    def test_agent_cap_blocks_recruiting_past_the_limit(self):
+        with patch.object(opportunities, "MAX_AGENTS", 2):
+            client.post("/api/agents", json={"name": "A", "role": "Researcher"})
+            client.post("/api/agents", json={"name": "B", "role": "Researcher"})
+            resp = client.post("/api/agents", json={"name": "C", "role": "Researcher"})
+        self.assertEqual(resp.status_code, 403)
+        self.assertEqual(len(client.get("/api/agents").json()), 2)
 
 
 if __name__ == "__main__":

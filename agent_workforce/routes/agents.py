@@ -56,6 +56,11 @@ def list_agents():
 @router.post("/api/agents")
 def create_agent(body: CreateAgent):
     conn = db.get_conn()
+    try:
+        opportunities.ensure_can_recruit_agent(conn)
+    except opportunities.WorkforceBlockedError as exc:
+        conn.close()
+        raise HTTPException(403, str(exc))
     agent_id = db.new_id()
     conn.execute(
         """INSERT INTO agents

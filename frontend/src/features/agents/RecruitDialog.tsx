@@ -25,10 +25,12 @@ export function RecruitDialog({
   initialDraft: AgentDraft | null;
 }) {
   const [form, setForm] = useState(emptyForm);
+  const [error, setError] = useState<string | null>(null);
   const createAgent = useCreateAgent();
 
   useEffect(() => {
     if (!open) return;
+    setError(null);
     if (initialDraft) {
       const matchedRole = ROLES.find((r) => r.toLowerCase() === initialDraft.role.toLowerCase()) ?? ROLES[0];
       setForm({ ...emptyForm, name: initialDraft.name, role: matchedRole, instructions: initialDraft.instructions });
@@ -39,6 +41,7 @@ export function RecruitDialog({
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
+    setError(null);
     createAgent.mutate(
       {
         name: form.name,
@@ -50,7 +53,7 @@ export function RecruitDialog({
         model: form.model,
         instructions: form.instructions,
       },
-      { onSuccess: () => onOpenChange(false) },
+      { onSuccess: () => onOpenChange(false), onError: (err) => setError(err.message) },
     );
   };
 
@@ -117,6 +120,7 @@ export function RecruitDialog({
             className="rounded-md border border-border bg-panel-2 p-2 text-text"
           />
         </label>
+        {error && <p className="text-sm text-err">{error}</p>}
         <div className="flex justify-end gap-2">
           <Button type="button" variant="secondary" onClick={() => onOpenChange(false)}>
             Cancel

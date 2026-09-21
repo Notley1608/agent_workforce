@@ -81,6 +81,11 @@ def approve_plan(plan_id: str):
         raise HTTPException(409, f"plan already {row['status']}")
 
     steps = json.loads(row["steps"])
+    try:
+        opportunities.ensure_can_recruit_agent(conn, count=len(steps))
+    except opportunities.WorkforceBlockedError as exc:
+        conn.close()
+        raise HTTPException(403, str(exc))
     workflow_id, agent_ids = planner.create_agents_and_workflow(conn, row["objective"], steps)
     conn.execute("UPDATE plans SET status = 'approved', workflow_id = ? WHERE id = ?", (workflow_id, plan_id))
     if row["opportunity_id"]:

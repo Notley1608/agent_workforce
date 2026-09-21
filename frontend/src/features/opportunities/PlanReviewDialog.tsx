@@ -1,3 +1,4 @@
+import { useEffect, useState } from "react";
 import { Button } from "../../components/Button";
 import { Dialog } from "../../components/Dialog";
 import { useApprovePlan, useRejectPlan } from "../../lib/api/plans";
@@ -14,6 +15,10 @@ export function PlanReviewDialog({
 }) {
   const approvePlan = useApprovePlan();
   const rejectPlan = useRejectPlan();
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => setError(null), [plan?.id]);
+
   if (!plan) return null;
 
   return (
@@ -37,26 +42,30 @@ export function PlanReviewDialog({
         {plan.status !== "proposed" ? (
           <p className="text-text-dim">Plan {plan.status}.</p>
         ) : (
-          <div className="flex justify-end gap-2">
-            <Button
-              variant="secondary"
-              onClick={() => rejectPlan.mutate(plan.id, { onSuccess: () => onOpenChange(false) })}
-            >
-              Reject
-            </Button>
-            <Button
-              onClick={() =>
-                approvePlan.mutate(plan.id, {
-                  onSuccess: (result) => {
-                    onOpenChange(false);
-                    onApproved?.(result);
-                  },
-                })
-              }
-            >
-              Approve
-            </Button>
-          </div>
+          <>
+            {error && <p className="text-err">{error}</p>}
+            <div className="flex justify-end gap-2">
+              <Button
+                variant="secondary"
+                onClick={() => rejectPlan.mutate(plan.id, { onSuccess: () => onOpenChange(false) })}
+              >
+                Reject
+              </Button>
+              <Button
+                onClick={() =>
+                  approvePlan.mutate(plan.id, {
+                    onSuccess: (result) => {
+                      onOpenChange(false);
+                      onApproved?.(result);
+                    },
+                    onError: (err) => setError(err.message),
+                  })
+                }
+              >
+                Approve
+              </Button>
+            </div>
+          </>
         )}
       </div>
     </Dialog>

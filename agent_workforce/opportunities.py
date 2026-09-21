@@ -44,19 +44,36 @@ class WorkforceBlockedError(Exception):
 # ponytail: fixed headcount to start, not a settings-table value - turn this
 # into a configurable setting (like daily_spend_limit) if the owner wants to
 # tune it live instead of editing code.
-MAX_AGENTS = 20
+MAX_AGENTS_BY_ROLE_TYPE = {"researcher": 5, "worker": 5, "business": 3}
 
 
-def ensure_can_recruit_agent(conn, count: int = 1) -> None:
-    """Recruiting is free to ask for but not free to run - every agent is a
-    standing option to spend tokens/money on schedule or on a whim. Call
-    before inserting any new agent row(s), whether one at a time (manual
-    recruit) or several at once (a mission's plan)."""
-    current = conn.execute("SELECT COUNT(*) AS n FROM agents").fetchone()["n"]
-    if current + count > MAX_AGENTS:
+def ensure_can_recruit_agent(conn, role_type: str) -> None:
+    """The owner manually recruiting an agent (POST /api/agents) is the only
+    way one is ever created - missions reuse the existing roster instead (see
+    planner.assign_agents_and_workflow) - so this is the one real gate on
+    headcount. Every agent is a standing option to spend tokens/money on
+    schedule or on a whim, so each role_type is capped independently rather
+    than growing without limit."""
+    cap = MAX_AGENTS_BY_ROLE_TYPE.get(role_type, MAX_AGENTS_BY_ROLE_TYPE["worker"])
+    current = conn.execute(
+        "SELECT COUNT(*) AS n FROM agents WHERE role_type = ?", (role_type,)
+    ).fetchone()["n"]
+    if current >= cap:
         raise WorkforceBlockedError(
-            f"agent cap reached ({MAX_AGENTS}); retire an existing agent before recruiting another"
+            f"{role_type} cap reached ({cap}); retire an existing {role_type} before recruiting another"
         )
+
+
+def business_economics(conn, opportunity_id: str) -> dict:
+    """A business's own P&L, scoped to its ledger entries - the number a
+    Business Agent reasons about instead of the workspace-wide balance()."""
+    row = conn.execute(
+        """SELECT COALESCE(SUM(CASE WHEN kind = 'revenue' THEN amount ELSE 0 END), 0) AS revenue,
+                  COALESCE(SUM(CASE WHEN kind = 'cost' THEN amount ELSE 0 END), 0) AS cost
+           FROM ledger WHERE opportunity_id = ?""",
+        (opportunity_id,),
+    ).fetchone()
+    return {"revenue": row["revenue"], "cost": row["cost"], "profit": row["revenue"] - row["cost"]}
 
 
 def balance(conn) -> float:

@@ -3,7 +3,7 @@
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
-from .. import db, opportunities
+from .. import db, jobs, opportunities
 
 router = APIRouter()
 
@@ -29,6 +29,14 @@ class RecordRevenue(BaseModel):
 
 class RecordLearning(BaseModel):
     note: str
+
+
+class CreateBusiness(BaseModel):
+    budget: float | None = None
+
+
+class SetBudget(BaseModel):
+    budget: float
 
 
 class AskOrchestrator(BaseModel):
@@ -88,7 +96,8 @@ def discover(body: DiscoverOpportunities):
 @router.post("/api/opportunities/{opportunity_id}/status")
 def set_status(opportunity_id: str, body: SetStatus):
     conn = db.get_conn()
-    if conn.execute("SELECT 1 FROM opportunities WHERE id = ?", (opportunity_id,)).fetchone() is None:
+    row = conn.execute("SELECT * FROM opportunities WHERE id = ?", (opportunity_id,)).fetchone()
+    if row is None:
         conn.close()
         raise HTTPException(404, "opportunity not found")
     try:
@@ -96,6 +105,66 @@ def set_status(opportunity_id: str, body: SetStatus):
     except ValueError as exc:
         conn.close()
         raise HTTPException(400, str(exc))
+    conn.commit()
+    # Owner moving a business back to "executing" (e.g. after resolving an
+    # escalation or topping up the budget) is what resumes its self-directed
+    # loop - nothing else calls _continue_business on a paused business.
+    if body.status == "executing" and row["business_agent_id"] is not None:
+        jobs._continue_business(conn, opportunity_id, "Owner resumed the business.")
+    updated = conn.execute("SELECT * FROM opportunities WHERE id = ?", (opportunity_id,)).fetchone()
+    conn.close()
+    return dict(updated)
+
+
+@router.post("/api/opportunities/{opportunity_id}/create_business")
+def create_business(opportunity_id: str, body: CreateBusiness):
+    """Owner-approved exception to "missions never create agents" (see
+    planner.assign_agents_and_workflow): turning an opportunity into a
+    standing, self-directed Business Agent is itself the owner's approval,
+    matching the one other exception (POST /api/agents)."""
+    conn = db.get_conn()
+    opp = conn.execute("SELECT * FROM opportunities WHERE id = ?", (opportunity_id,)).fetchone()
+    if opp is None:
+        conn.close()
+        raise HTTPException(404, "opportunity not found")
+    if opp["business_agent_id"] is not None:
+        conn.close()
+        raise HTTPException(409, "opportunity already has a business agent")
+    try:
+        opportunities.ensure_can_recruit_agent(conn, "business")
+    except opportunities.WorkforceBlockedError as exc:
+        conn.close()
+        raise HTTPException(403, str(exc))
+
+    agent_id = db.new_id()
+    conn.execute(
+        """INSERT INTO agents
+           (id, name, role, role_type, capabilities_override, avatar, provider, model,
+            instructions, desk_x, desk_y, status, created_at)
+           VALUES (?, ?, 'Business Operator', 'business', NULL, '🏢', 'groq', 'openai/gpt-oss-120b',
+                   ?, 0, 0, 'idle', ?)""",
+        (agent_id, opp["title"], f"You run the business: {opp['title']}. {opp['description']}", db.now()),
+    )
+    conn.execute(
+        "UPDATE opportunities SET business_agent_id = ?, budget = ?, status = 'executing', updated_at = ? WHERE id = ?",
+        (agent_id, body.budget, db.now(), opportunity_id),
+    )
+    conn.commit()
+    jobs._continue_business(conn, opportunity_id, "")
+    row = conn.execute("SELECT * FROM opportunities WHERE id = ?", (opportunity_id,)).fetchone()
+    conn.close()
+    return dict(row)
+
+
+@router.post("/api/opportunities/{opportunity_id}/budget")
+def set_budget(opportunity_id: str, body: SetBudget):
+    conn = db.get_conn()
+    if conn.execute("SELECT 1 FROM opportunities WHERE id = ?", (opportunity_id,)).fetchone() is None:
+        conn.close()
+        raise HTTPException(404, "opportunity not found")
+    conn.execute(
+        "UPDATE opportunities SET budget = ?, updated_at = ? WHERE id = ?", (body.budget, db.now(), opportunity_id)
+    )
     conn.commit()
     row = conn.execute("SELECT * FROM opportunities WHERE id = ?", (opportunity_id,)).fetchone()
     conn.close()

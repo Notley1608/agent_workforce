@@ -10,7 +10,7 @@ workflow engine (routes/workflows.py) to run it, so this module only adds the
 import json
 import re
 
-from . import db
+from . import db, opportunities
 from .providers import run_model
 
 PLANNER_PROVIDER = "groq"
@@ -126,6 +126,53 @@ def decide_recovery(objective: str, role: str, error: str) -> dict:
     return decision
 
 
+BUSINESS_SYSTEM_PROMPT = """You are the autonomous operator of a real business inside Crew, an AI workforce. \
+Nobody assigns you tasks - you decide what this business does next, within your budget, until the objective \
+is met, no longer worth pursuing, or you need the Owner's input.
+
+Respond with ONLY a JSON object, no markdown fences, no commentary:
+{{"action": "job" | "pause" | "escalate", "instructions": "the single next unit of work, if action is job", "reason": "why"}}
+
+- "job": propose the next concrete unit of work this business needs (research, writing, production, \
+analysis, outreach - whatever moves it forward). One unit at a time, not a whole plan.
+- "pause": nothing productive to do right now (e.g. waiting on results) - you'll be asked again once something changes.
+- "escalate": you need the Owner before continuing (budget exhausted, a decision beyond your authority, a real blocker).
+
+Business objective: {objective}
+Budget: {budget}
+Spent so far: {spent}
+Revenue so far: {revenue}
+What you've learned so far: {memory}
+Most recent result: {last_result}
+"""
+
+
+def decide_next_business_job(conn, opportunity, last_result: str) -> dict:
+    """The self-directed loop's brain: called after every business job resolves
+    (see jobs._continue_business) instead of following a plan someone else
+    wrote. Failing safe means escalating, not guessing - see the except below."""
+    economics = opportunities.business_economics(conn, opportunity["id"])
+    budget = opportunity["budget"]
+    system = BUSINESS_SYSTEM_PROMPT.format(
+        objective=f"{opportunity['title']}: {opportunity['description']}",
+        budget=f"${budget:.2f}" if budget is not None else "no limit set",
+        spent=f"${economics['cost']:.2f}",
+        revenue=f"${economics['revenue']:.2f}",
+        memory=opportunity["notes"] or "(none yet)",
+        last_result=last_result or "(business just started - no work done yet)",
+    )
+    try:
+        result = run_model(PLANNER_PROVIDER, PLANNER_MODEL, system, "Decide the business's next move.", set())
+        decision = _extract_json(result.text)
+        if decision.get("action") not in ("job", "pause", "escalate"):
+            raise ValueError(f"invalid action: {decision.get('action')!r}")
+    except Exception as exc:
+        return {"action": "escalate", "reason": f"business planner could not decide: {exc}"}
+    decision.setdefault("reason", "")
+    decision.setdefault("instructions", "")
+    return decision
+
+
 AGENT_PROPOSAL_PROMPT = """You are the Orchestrator of an autonomous AI workforce called Crew, drafting a new \
 agent to hire for the owner to review and approve.
 
@@ -171,31 +218,30 @@ def default_capabilities_for_role_type(role_type: str) -> list[str] | None:
     return ["web"] if role_type == "researcher" else None
 
 
-def create_agents_and_workflow(conn, objective: str, steps: list[dict]) -> tuple[str, list[str]]:
-    """Turns an approved plan into real rows: one agent per step, one workflow chaining them."""
+def assign_agents_and_workflow(conn, objective: str, steps: list[dict]) -> tuple[str, list[str]]:
+    """Turns an approved plan into a workflow chaining existing agents - only
+    the owner's manual recruit (POST /api/agents) ever creates an agent, so a
+    mission must staff itself from the roster already on hand. Each step is
+    matched to the least-recently-used agent of its role_type (agents with no
+    jobs yet sort first), which spreads mission work across the roster
+    instead of always picking the same one."""
     agent_ids = []
     for step in steps:
-        agent_id = db.new_id()
         role_type = infer_role_type(step["role"])
-        capabilities_override = default_capabilities_for_role_type(role_type)
-        conn.execute(
-            """INSERT INTO agents
-               (id, name, role, role_type, capabilities_override, avatar, provider, model,
-                instructions, desk_x, desk_y, status, created_at)
-               VALUES (?, ?, ?, ?, ?, '🤖', ?, ?, ?, 0, 0, 'idle', ?)""",
-            (
-                agent_id,
-                step.get("name") or step["role"],
-                step["role"],
-                role_type,
-                json.dumps(capabilities_override) if capabilities_override is not None else None,
-                step["provider"],
-                step["model"],
-                step["instructions"],
-                db.now(),
-            ),
-        )
-        agent_ids.append(agent_id)
+        agent = conn.execute(
+            """SELECT agents.id FROM agents
+               LEFT JOIN jobs ON jobs.agent_id = agents.id
+               WHERE agents.role_type = ?
+               GROUP BY agents.id
+               ORDER BY MAX(jobs.created_at) ASC
+               LIMIT 1""",
+            (role_type,),
+        ).fetchone()
+        if agent is None:
+            raise opportunities.WorkforceBlockedError(
+                f"no {role_type} agent recruited yet; recruit one before approving this plan"
+            )
+        agent_ids.append(agent["id"])
 
     workflow_id = db.new_id()
     conn.execute(

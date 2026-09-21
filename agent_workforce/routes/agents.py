@@ -57,11 +57,20 @@ def list_agents():
 def create_agent(body: CreateAgent):
     conn = db.get_conn()
     try:
-        opportunities.ensure_can_recruit_agent(conn)
+        opportunities.ensure_can_recruit_agent(conn, body.role_type)
     except opportunities.WorkforceBlockedError as exc:
         conn.close()
         raise HTTPException(403, str(exc))
     agent_id = db.new_id()
+    # No explicit override from the owner: fall back to the role_type's safety
+    # default (see planner.default_capabilities_for_role_type) rather than
+    # inheriting every enabled capability - this is the only agent-creation
+    # path left, so it's the only place left to apply that default.
+    capabilities_override = (
+        body.capabilities_override
+        if body.capabilities_override is not None
+        else planner.default_capabilities_for_role_type(body.role_type)
+    )
     conn.execute(
         """INSERT INTO agents
            (id, name, role, role_type, capabilities_override, avatar, provider, model,
@@ -72,7 +81,7 @@ def create_agent(body: CreateAgent):
             body.name,
             body.role,
             body.role_type,
-            json.dumps(body.capabilities_override) if body.capabilities_override is not None else None,
+            json.dumps(capabilities_override) if capabilities_override is not None else None,
             body.avatar,
             body.provider,
             body.model,
@@ -86,6 +95,27 @@ def create_agent(body: CreateAgent):
     row = conn.execute("SELECT * FROM agents WHERE id = ?", (agent_id,)).fetchone()
     conn.close()
     return dict(row)
+
+
+@router.delete("/api/agents/{agent_id}")
+def retire_agent(agent_id: str):
+    """The other half of the recruit cap: retiring is the only way to free a
+    slot under MAX_AGENTS_BY_ROLE_TYPE once it's full (see
+    ensure_can_recruit_agent's error message)."""
+    conn = db.get_conn()
+    agent = conn.execute("SELECT * FROM agents WHERE id = ?", (agent_id,)).fetchone()
+    if agent is None:
+        conn.close()
+        raise HTTPException(404, "agent not found")
+    if agent["status"] == "working":
+        conn.close()
+        raise HTTPException(409, "agent is currently working; wait for it to finish before retiring it")
+    conn.execute("DELETE FROM job_events WHERE job_id IN (SELECT id FROM jobs WHERE agent_id = ?)", (agent_id,))
+    conn.execute("DELETE FROM jobs WHERE agent_id = ?", (agent_id,))
+    conn.execute("DELETE FROM agents WHERE id = ?", (agent_id,))
+    conn.commit()
+    conn.close()
+    return {"ok": True}
 
 
 @router.post("/api/agents/propose")
@@ -180,6 +210,8 @@ def approve_job(job_id: str):
         conn.commit()
         if job["workflow_run_id"] is not None:
             jobs._advance_workflow(conn, job["workflow_run_id"], job["step_index"], output)
+        elif job["opportunity_id"] is not None:
+            jobs._continue_business(conn, job["opportunity_id"], output)
     conn.close()
     return {"ok": True, "output": output}
 
@@ -207,6 +239,8 @@ def reject_job(job_id: str):
         if job["workflow_run_id"] is not None:
             agent = conn.execute("SELECT * FROM agents WHERE id = ?", (job["agent_id"],)).fetchone()
             jobs._handle_step_failure(conn, job, agent, error)
+        elif job["opportunity_id"] is not None:
+            jobs._continue_business(conn, job["opportunity_id"], f"[previous job rejected: {error}]")
     conn.close()
     return {"ok": True}
 

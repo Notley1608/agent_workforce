@@ -361,11 +361,36 @@ class JobLifecycleTest(unittest.TestCase):
         job = _wait_for_job(agent["id"], job_id, statuses=("awaiting_approval",))
         self.assertEqual(job["output"], "echo hello-terminal")
 
-        approve = client.post(f"/api/jobs/{job_id}/approve")
+        fake_result = SimpleNamespace(stdout="hello-terminal\n", stderr="", returncode=0)
+        with patch("agent_workforce.jobs.subprocess.run", return_value=fake_result) as run:
+            approve = client.post(f"/api/jobs/{job_id}/approve")
         self.assertEqual(approve.status_code, 200)
         job_after = _wait_for_job(agent["id"], job_id)
         self.assertEqual(job_after["status"], "completed")
         self.assertEqual(job_after["output"], "hello-terminal")
+
+        docker_cmd = run.call_args.args[0]
+        self.assertEqual(docker_cmd[:3], ["docker", "run", "--rm"])
+        self.assertIn("--network", docker_cmd)
+        self.assertIn("none", docker_cmd)
+        self.assertIn("--read-only", docker_cmd)
+        self.assertEqual(docker_cmd[-3:], ["sh", "-c", "echo hello-terminal"])
+
+    def test_terminal_capability_reports_docker_missing_instead_of_running_unsandboxed(self):
+        jobs.TERMINAL_WORKDIR = Path(self.tmpdir.name) / "workspace"
+        providers.PROVIDERS["groq"] = lambda model, system, prompt, capabilities: ModelResult(
+            "echo hello-terminal", 1, 1
+        )
+        client.post("/api/infrastructure/terminal/toggle")
+
+        agent = client.post("/api/agents", json={"name": "Term2", "role": "Engineer"}).json()
+        job_id = client.post(f"/api/agents/{agent['id']}/tasks", json={"input": "x"}).json()["job_id"]
+        _wait_for_job(agent["id"], job_id, statuses=("awaiting_approval",))
+
+        with patch("agent_workforce.jobs.subprocess.run", side_effect=FileNotFoundError()):
+            client.post(f"/api/jobs/{job_id}/approve")
+        job_after = _wait_for_job(agent["id"], job_id)
+        self.assertIn("docker is not installed", job_after["output"])
 
     def test_automation_skips_run_when_over_daily_budget(self):
         providers.PROVIDERS["groq"] = lambda model, system, prompt, capabilities: ModelResult(
@@ -561,7 +586,10 @@ class PlannerTest(unittest.TestCase):
         resp = client.post("/api/plans", json={"objective": "Do a thing"})
         self.assertEqual(resp.status_code, 502)
 
-    def test_approve_plan_creates_agents_workflow_and_runs_it(self):
+    def test_approve_plan_assigns_an_existing_agent_and_runs_it(self):
+        recruited = client.post(
+            "/api/agents", json={"name": "Researcher", "role": "Researcher", "role_type": "researcher"}
+        ).json()
         step = {
             "name": "Researcher",
             "role": "Researcher",
@@ -575,26 +603,25 @@ class PlannerTest(unittest.TestCase):
         plan = client.post("/api/plans", json={"objective": "Monitor competitors weekly"}).json()
         approval = client.post(f"/api/plans/{plan['id']}/approve").json()
         self.assertIn("workflow_id", approval)
-        self.assertEqual(len(approval["agent_ids"]), 1)
+        self.assertEqual(approval["agent_ids"], [recruited["id"]])
 
         run = _wait_for_run(approval["workflow_id"], approval["run_id"])
         self.assertEqual(run["status"], "completed")
 
-        agents_after = client.get("/api/agents").json()
-        self.assertEqual(len(agents_after), 1)
-        self.assertEqual(agents_after[0]["role"], "Researcher")
+        # a mission never creates an agent - only the recruit above did
+        self.assertEqual(len(client.get("/api/agents").json()), 1)
 
-    def test_agent_cap_blocks_a_mission_that_would_exceed_it(self):
+    def test_plan_approval_blocks_when_no_matching_agent_is_recruited(self):
         step = {"name": "X", "role": "Researcher", "provider": "groq", "instructions": ""}
-        providers.PROVIDERS["groq"] = lambda model, system, prompt, capabilities: _fake_plan_response([step, step])
-        plan = client.post("/api/plans", json={"objective": "Do two things"}).json()
-        with patch.object(opportunities, "MAX_AGENTS", 1):
-            approval = client.post(f"/api/plans/{plan['id']}/approve")
+        providers.PROVIDERS["groq"] = lambda model, system, prompt, capabilities: _fake_plan_response([step])
+        plan = client.post("/api/plans", json={"objective": "Do a thing"}).json()
+        approval = client.post(f"/api/plans/{plan['id']}/approve")
         self.assertEqual(approval.status_code, 403)
         self.assertEqual(client.get("/api/agents").json(), [])
         self.assertEqual(client.get("/api/plans").json()[0]["status"], "proposed")
 
     def test_cannot_approve_a_plan_twice(self):
+        client.post("/api/agents", json={"name": "R", "role": "Researcher", "role_type": "researcher"})
         step = {"name": "X", "role": "Researcher", "provider": "groq", "instructions": ""}
         providers.PROVIDERS["groq"] = lambda model, system, prompt, capabilities: _fake_plan_response([step])
         plan = client.post("/api/plans", json={"objective": "Do a thing"}).json()
@@ -710,6 +737,7 @@ class OpportunitiesTest(unittest.TestCase):
         self.assertEqual(bad.status_code, 400)
 
     def test_approving_a_plan_linked_to_an_opportunity_tracks_outcome(self):
+        client.post("/api/agents", json={"name": "R", "role": "Researcher", "role_type": "researcher"})
         opp = client.post("/api/opportunities", json={"title": "Docs SaaS", "description": "auto docs"}).json()
         step = {
             "name": "Researcher", "role": "Researcher", "provider": "groq",
@@ -726,33 +754,22 @@ class OpportunitiesTest(unittest.TestCase):
         self.assertEqual(opp_after["workflow_id"], approval["workflow_id"])
         self.assertEqual(opp_after["status"], "success")
 
-    def test_planner_created_researcher_defaults_to_web_only_capability(self):
-        step = {
-            "name": "Digger", "role": "Researcher", "provider": "groq",
-            "model": "openai/gpt-oss-120b", "capabilities": [], "instructions": "Dig.",
-        }
+    def test_plan_approval_prefers_the_least_recently_used_matching_agent(self):
+        idle = client.post(
+            "/api/agents", json={"name": "Idle", "role": "Researcher", "role_type": "researcher"}
+        ).json()
+        busy = client.post(
+            "/api/agents", json={"name": "Busy", "role": "Researcher", "role_type": "researcher"}
+        ).json()
+        providers.PROVIDERS["groq"] = lambda model, system, prompt, capabilities: ModelResult("ok", 1, 1)
+        job_id = client.post(f"/api/agents/{busy['id']}/tasks", json={"input": "x"}).json()["job_id"]
+        _wait_for_job(busy["id"], job_id)
+
+        step = {"name": "X", "role": "Researcher", "provider": "groq", "instructions": ""}
         providers.PROVIDERS["groq"] = lambda model, system, prompt, capabilities: _fake_plan_response([step])
         plan = client.post("/api/plans", json={"objective": "dig"}).json()
         approval = client.post(f"/api/plans/{plan['id']}/approve").json()
-        _wait_for_run(approval["workflow_id"], approval["run_id"])
-
-        agent = client.get(f"/api/agents/{approval['agent_ids'][0]}").json()
-        self.assertEqual(agent["role_type"], "researcher")
-        self.assertEqual(json.loads(agent["capabilities_override"]), ["web"])
-
-    def test_planner_created_worker_inherits_global_capabilities(self):
-        step = {
-            "name": "Builder", "role": "Engineer", "provider": "groq",
-            "model": "openai/gpt-oss-120b", "capabilities": [], "instructions": "Build.",
-        }
-        providers.PROVIDERS["groq"] = lambda model, system, prompt, capabilities: _fake_plan_response([step])
-        plan = client.post("/api/plans", json={"objective": "build"}).json()
-        approval = client.post(f"/api/plans/{plan['id']}/approve").json()
-        _wait_for_run(approval["workflow_id"], approval["run_id"])
-
-        agent = client.get(f"/api/agents/{approval['agent_ids'][0]}").json()
-        self.assertEqual(agent["role_type"], "worker")
-        self.assertIsNone(agent["capabilities_override"])
+        self.assertEqual(approval["agent_ids"], [idle["id"]])
 
     def test_emergency_stop_blocks_new_single_agent_tasks(self):
         providers.PROVIDERS["groq"] = lambda model, system, prompt, capabilities: ModelResult("ok", 1, 1)
@@ -856,13 +873,155 @@ class OpportunitiesTest(unittest.TestCase):
         ).json()
         self.assertEqual(json.loads(agent["capabilities_override"]), ["web"])
 
+    def test_recruiting_a_researcher_defaults_to_web_only_capability(self):
+        agent = client.post(
+            "/api/agents", json={"name": "Digger", "role": "Researcher", "role_type": "researcher"}
+        ).json()
+        self.assertEqual(json.loads(agent["capabilities_override"]), ["web"])
+
+    def test_recruiting_a_worker_inherits_global_capabilities(self):
+        agent = client.post(
+            "/api/agents", json={"name": "Builder", "role": "Engineer", "role_type": "worker"}
+        ).json()
+        self.assertIsNone(agent["capabilities_override"])
+
     def test_agent_cap_blocks_recruiting_past_the_limit(self):
-        with patch.object(opportunities, "MAX_AGENTS", 2):
-            client.post("/api/agents", json={"name": "A", "role": "Researcher"})
-            client.post("/api/agents", json={"name": "B", "role": "Researcher"})
-            resp = client.post("/api/agents", json={"name": "C", "role": "Researcher"})
+        with patch.object(opportunities, "MAX_AGENTS_BY_ROLE_TYPE", {"researcher": 5, "worker": 2}):
+            client.post("/api/agents", json={"name": "A", "role": "Engineer", "role_type": "worker"})
+            client.post("/api/agents", json={"name": "B", "role": "Engineer", "role_type": "worker"})
+            resp = client.post("/api/agents", json={"name": "C", "role": "Engineer", "role_type": "worker"})
         self.assertEqual(resp.status_code, 403)
         self.assertEqual(len(client.get("/api/agents").json()), 2)
+
+    def test_retiring_an_agent_frees_its_cap_slot(self):
+        with patch.object(opportunities, "MAX_AGENTS_BY_ROLE_TYPE", {"researcher": 5, "worker": 1}):
+            agent = client.post("/api/agents", json={"name": "A", "role": "Engineer", "role_type": "worker"}).json()
+            blocked = client.post("/api/agents", json={"name": "B", "role": "Engineer", "role_type": "worker"})
+            self.assertEqual(blocked.status_code, 403)
+
+            retire = client.delete(f"/api/agents/{agent['id']}")
+            self.assertEqual(retire.status_code, 200)
+            self.assertEqual(client.get("/api/agents").json(), [])
+
+            recruited = client.post("/api/agents", json={"name": "B", "role": "Engineer", "role_type": "worker"})
+        self.assertEqual(recruited.status_code, 200)
+
+    def test_retiring_a_working_agent_is_blocked(self):
+        providers.PROVIDERS["groq"] = lambda model, system, prompt, capabilities: (
+            time.sleep(0.3) or ModelResult("ok", 1, 1)
+        )
+        agent = client.post("/api/agents", json={"name": "A", "role": "Engineer"}).json()
+        client.post(f"/api/agents/{agent['id']}/tasks", json={"input": "x"})
+        time.sleep(0.1)
+
+        resp = client.delete(f"/api/agents/{agent['id']}")
+        self.assertEqual(resp.status_code, 409)
+
+    def test_agent_cap_is_independent_per_role_type(self):
+        with patch.object(opportunities, "MAX_AGENTS_BY_ROLE_TYPE", {"researcher": 1, "worker": 1}):
+            client.post("/api/agents", json={"name": "W", "role": "Engineer", "role_type": "worker"})
+            researcher = client.post(
+                "/api/agents", json={"name": "R", "role": "Researcher", "role_type": "researcher"}
+            )
+        self.assertEqual(researcher.status_code, 200)
+
+    def test_business_economics_computes_profit_from_scoped_ledger_entries(self):
+        conn = db.get_conn()
+        opp_id = opportunities.create_opportunity(conn, "Shorts")
+        opportunities.record_ledger(conn, "cost", 10, opportunity_id=opp_id)
+        opportunities.record_ledger(conn, "revenue", 30, opportunity_id=opp_id)
+        opportunities.record_ledger(conn, "cost", 5, opportunity_id="other-opp")
+        conn.commit()
+        economics = opportunities.business_economics(conn, opp_id)
+        conn.close()
+        self.assertEqual(economics, {"revenue": 30, "cost": 10, "profit": 20})
+
+    def test_decide_next_business_job_returns_the_parsed_decision(self):
+        providers.PROVIDERS["groq"] = lambda model, system, prompt, capabilities: ModelResult(
+            json.dumps({"action": "job", "instructions": "write a script", "reason": "kick off"}), 1, 1
+        )
+        conn = db.get_conn()
+        opp_id = opportunities.create_opportunity(conn, "Shorts", "short form content")
+        conn.commit()
+        opp = dict(conn.execute("SELECT * FROM opportunities WHERE id = ?", (opp_id,)).fetchone())
+        decision = planner.decide_next_business_job(conn, opp, "")
+        conn.close()
+        self.assertEqual(decision["action"], "job")
+        self.assertEqual(decision["instructions"], "write a script")
+
+    def test_decide_next_business_job_escalates_on_unparsable_output(self):
+        providers.PROVIDERS["groq"] = lambda model, system, prompt, capabilities: ModelResult("not json", 1, 1)
+        conn = db.get_conn()
+        opp_id = opportunities.create_opportunity(conn, "Shorts")
+        conn.commit()
+        opp = dict(conn.execute("SELECT * FROM opportunities WHERE id = ?", (opp_id,)).fetchone())
+        decision = planner.decide_next_business_job(conn, opp, "")
+        conn.close()
+        self.assertEqual(decision["action"], "escalate")
+
+    def test_create_business_with_zero_budget_immediately_needs_approval(self):
+        opp = client.post("/api/opportunities", json={"title": "Shorts", "description": "short form content"}).json()
+        resp = client.post(f"/api/opportunities/{opp['id']}/create_business", json={"budget": 0}).json()
+        self.assertEqual(resp["status"], "awaiting_approval")
+        self.assertIsNotNone(resp["business_agent_id"])
+
+    def test_create_business_twice_is_blocked(self):
+        opp = client.post("/api/opportunities", json={"title": "Shorts"}).json()
+        client.post(f"/api/opportunities/{opp['id']}/create_business", json={"budget": 0})
+        second = client.post(f"/api/opportunities/{opp['id']}/create_business", json={"budget": 0})
+        self.assertEqual(second.status_code, 409)
+
+    def test_create_business_is_blocked_by_the_business_cap(self):
+        with patch.object(opportunities, "MAX_AGENTS_BY_ROLE_TYPE", {"researcher": 5, "worker": 5, "business": 0}):
+            opp = client.post("/api/opportunities", json={"title": "Shorts"}).json()
+            resp = client.post(f"/api/opportunities/{opp['id']}/create_business", json={})
+        self.assertEqual(resp.status_code, 403)
+
+    def test_set_budget_endpoint_updates_the_ceiling(self):
+        opp = client.post("/api/opportunities", json={"title": "Shorts"}).json()
+        updated = client.post(f"/api/opportunities/{opp['id']}/budget", json={"budget": 25}).json()
+        self.assertEqual(updated["budget"], 25)
+
+    def test_create_business_runs_the_self_directed_loop_until_pause(self):
+        call_count = {"n": 0}
+
+        def fake(model, system, prompt, capabilities):
+            if prompt == "Decide the business's next move.":
+                call_count["n"] += 1
+                if call_count["n"] == 1:
+                    return ModelResult(json.dumps({"action": "job", "instructions": "write a script"}), 1, 1)
+                return ModelResult(json.dumps({"action": "pause", "reason": "waiting on results"}), 1, 1)
+            return ModelResult("script written", 1, 1)
+
+        providers.PROVIDERS["groq"] = fake
+        opp = client.post("/api/opportunities", json={"title": "Shorts", "description": "short form content"}).json()
+        created = client.post(f"/api/opportunities/{opp['id']}/create_business", json={}).json()
+        self.assertIsNotNone(created["business_agent_id"])
+        self.assertEqual(created["status"], "executing")
+
+        deadline = time.time() + 5
+        status = created["status"]
+        while time.time() < deadline and status != "paused":
+            time.sleep(0.05)
+            status = client.get(f"/api/opportunities/{opp['id']}").json()["status"]
+        self.assertEqual(status, "paused")
+
+        agent_jobs = client.get(f"/api/agents/{created['business_agent_id']}/jobs").json()
+        self.assertEqual(len(agent_jobs), 1)
+        self.assertEqual(agent_jobs[0]["status"], "completed")
+
+    def test_resuming_a_paused_business_via_status_continues_the_loop(self):
+        opp = client.post("/api/opportunities", json={"title": "Shorts", "description": "short form content"}).json()
+        created = client.post(f"/api/opportunities/{opp['id']}/create_business", json={"budget": 0}).json()
+        self.assertEqual(created["status"], "awaiting_approval")
+
+        client.post(f"/api/opportunities/{opp['id']}/budget", json={"budget": 10})
+        providers.PROVIDERS["groq"] = lambda model, system, prompt, capabilities: ModelResult(
+            json.dumps({"action": "escalate", "reason": "need owner input on posting account"}), 1, 1
+        )
+        resumed = client.post(f"/api/opportunities/{opp['id']}/status", json={"status": "executing"}).json()
+        self.assertEqual(resumed["status"], "awaiting_approval")
+        self.assertEqual(resumed["notes"], "need owner input on posting account")
 
 
 if __name__ == "__main__":

@@ -143,6 +143,7 @@ JOB_COLUMN_MIGRATIONS = {
     "workflow_run_id": "ALTER TABLE jobs ADD COLUMN workflow_run_id TEXT",
     "step_index": "ALTER TABLE jobs ADD COLUMN step_index INTEGER",
     "risky_capabilities": "ALTER TABLE jobs ADD COLUMN risky_capabilities TEXT",
+    "opportunity_id": "ALTER TABLE jobs ADD COLUMN opportunity_id TEXT",
 }
 
 AGENT_COLUMN_MIGRATIONS = {
@@ -156,6 +157,8 @@ PLAN_COLUMN_MIGRATIONS = {
 
 OPPORTUNITY_COLUMN_MIGRATIONS = {
     "notes": "ALTER TABLE opportunities ADD COLUMN notes TEXT",
+    "business_agent_id": "ALTER TABLE opportunities ADD COLUMN business_agent_id TEXT",
+    "budget": "ALTER TABLE opportunities ADD COLUMN budget REAL",
 }
 
 

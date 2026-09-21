@@ -21,6 +21,11 @@ OUTPUT_DIR = Path.home() / ".agent_workforce" / "outputs"
 TERMINAL_WORKDIR = Path.home() / ".agent_workforce" / "workspace"
 MAX_TERMINAL_SECONDS = 30
 
+# ponytail: one stock image for every terminal job - covers most agent asks
+# (python/bash/coreutils) without owning a custom Dockerfile. Swap for a
+# purpose-built image if a task needs tools this one doesn't have.
+SANDBOX_IMAGE = "python:3.12-slim"
+
 
 def write_output_file(job_id: str, text: str) -> str:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -35,19 +40,36 @@ def _write_file_action(job_id: str, text: str) -> tuple[str, str]:
 
 
 def _run_terminal_action(job_id: str, command: str) -> tuple[str, str]:
-    # ponytail: sandboxed by cwd only, not a real container/jail - the human
-    # approval step reading the exact command before it runs IS the safety
-    # net here (same model Claude Code itself uses). Tighten with a real
-    # sandbox (docker/firejail) if this app ever runs multi-user.
+    # Real jail, not just a cwd: a throwaway container with no host network,
+    # a read-only root filesystem (only the bind-mounted workdir is
+    # writable), and capped memory/process count. The human approval step
+    # reading the exact command is still the first line of defense, but a
+    # command that gets approved can no longer touch anything outside
+    # TERMINAL_WORKDIR or the outside network, even if it's malicious/buggy.
+    # ponytail: no non-root --user pin (bind-mount write permissions across
+    # Docker Desktop/OrbStack on macOS are inconsistent under one) and no
+    # seccomp profile - tighten further if this ever runs multi-user.
     TERMINAL_WORKDIR.mkdir(parents=True, exist_ok=True)
+    docker_cmd = [
+        "docker", "run", "--rm",
+        "--network", "none",
+        "--memory", "256m",
+        "--pids-limit", "128",
+        "--read-only",
+        "--tmpfs", "/tmp",
+        "-v", f"{TERMINAL_WORKDIR}:/workspace",
+        "-w", "/workspace",
+        SANDBOX_IMAGE,
+        "sh", "-c", command,
+    ]
     try:
-        result = subprocess.run(
-            command, shell=True, cwd=TERMINAL_WORKDIR, capture_output=True, text=True, timeout=MAX_TERMINAL_SECONDS
-        )
+        result = subprocess.run(docker_cmd, capture_output=True, text=True, timeout=MAX_TERMINAL_SECONDS)
         output = (result.stdout + result.stderr).strip()
-        return output, f"ran command (exit {result.returncode}): {command}"
+        return output, f"ran sandboxed command (exit {result.returncode}): {command}"
     except subprocess.TimeoutExpired:
         return f"[command timed out after {MAX_TERMINAL_SECONDS}s]", f"command timed out: {command}"
+    except FileNotFoundError:
+        return "[docker is not installed - cannot safely run a shell command]", "terminal blocked: docker not found"
 
 
 # Each risky capability maps to the (job_id, text) -> (new_text, event_label)
@@ -83,12 +105,13 @@ def job_row_to_dict(row) -> dict:
     return d
 
 
-def insert_job(conn, agent_id: str, input_text: str, workflow_run_id=None, step_index=None) -> str:
+def insert_job(conn, agent_id: str, input_text: str, workflow_run_id=None, step_index=None,
+                opportunity_id=None) -> str:
     job_id = db.new_id()
     conn.execute(
-        """INSERT INTO jobs (id, agent_id, input, status, workflow_run_id, step_index, created_at)
-           VALUES (?, ?, ?, 'pending', ?, ?, ?)""",
-        (job_id, agent_id, input_text, workflow_run_id, step_index, db.now()),
+        """INSERT INTO jobs (id, agent_id, input, status, workflow_run_id, step_index, opportunity_id, created_at)
+           VALUES (?, ?, ?, 'pending', ?, ?, ?, ?)""",
+        (job_id, agent_id, input_text, workflow_run_id, step_index, opportunity_id, db.now()),
     )
     return job_id
 
@@ -161,7 +184,7 @@ def execute_job(job_id: str, agent_id: str) -> None:
                 opp_id = (
                     opportunities.opportunity_id_for_workflow_run(conn, job["workflow_run_id"])
                     if job["workflow_run_id"] is not None
-                    else None
+                    else job["opportunity_id"]
                 )
                 opportunities.record_ledger(conn, "cost", cost, opportunity_id=opp_id, job_id=job_id,
                                              note=f"{agent['name']} ({agent['model']})")
@@ -175,6 +198,8 @@ def execute_job(job_id: str, agent_id: str) -> None:
                 conn.commit()
                 if job["workflow_run_id"] is not None:
                     _advance_workflow(conn, job["workflow_run_id"], job["step_index"], result.text)
+                elif job["opportunity_id"] is not None:
+                    _continue_business(conn, job["opportunity_id"], result.text)
         else:
             record_event(conn, job_id, "Discarded result (job was cancelled)")
             conn.commit()
@@ -188,6 +213,8 @@ def execute_job(job_id: str, agent_id: str) -> None:
             conn.commit()
             if job["workflow_run_id"] is not None:
                 _handle_step_failure(conn, job, agent, str(exc))
+            elif job["opportunity_id"] is not None:
+                _continue_business(conn, job["opportunity_id"], f"[previous job failed: {exc}]")
         else:
             record_event(conn, job_id, "Discarded failure (job was cancelled)")
             conn.commit()
@@ -195,6 +222,44 @@ def execute_job(job_id: str, agent_id: str) -> None:
         conn.execute("UPDATE agents SET status = 'idle' WHERE id = ?", (agent_id,))
         conn.commit()
         conn.close()
+
+
+def _continue_business(conn, opportunity_id: str, last_result: str) -> None:
+    """The self-directed loop: after a business job resolves, the business agent
+    decides its own next move instead of following a pre-planned chain (see
+    planner.decide_next_business_job). Runs until it pauses or escalates."""
+    opp = conn.execute("SELECT * FROM opportunities WHERE id = ?", (opportunity_id,)).fetchone()
+    if opp is None or opp["status"] != "executing":
+        return  # paused/escalated/closed elsewhere - don't keep looping
+    agent_id = opp["business_agent_id"]
+    economics = opportunities.business_economics(conn, opportunity_id)
+    if opp["budget"] is not None and economics["cost"] >= opp["budget"]:
+        opportunities.set_status(conn, opportunity_id, "awaiting_approval")
+        conn.commit()
+        return
+
+    decision = planner.decide_next_business_job(conn, dict(opp), last_result)
+
+    if decision["action"] == "pause":
+        opportunities.set_status(conn, opportunity_id, "paused")
+        conn.commit()
+        return
+    if decision["action"] == "escalate":
+        opportunities.set_status(conn, opportunity_id, "awaiting_approval")
+        conn.execute("UPDATE opportunities SET notes = ? WHERE id = ?", (decision["reason"], opportunity_id))
+        conn.commit()
+        return
+
+    try:
+        opportunities.ensure_can_start_work(conn)
+    except opportunities.WorkforceBlockedError:
+        opportunities.set_status(conn, opportunity_id, "paused")
+        conn.commit()
+        return
+
+    job_id = insert_job(conn, agent_id, decision["instructions"], opportunity_id=opportunity_id)
+    conn.commit()
+    EXECUTOR.submit(execute_job, job_id, agent_id)
 
 
 def _advance_workflow(conn, run_id: str, step_index: int, step_output: str) -> None:

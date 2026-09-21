@@ -31,6 +31,7 @@ export function useWorkflowRuns(workflowId: string, { live = false }: { live?: b
   return useQuery({
     queryKey: ["workflows", workflowId, "runs"],
     queryFn: () => apiGet(`/workflows/${workflowId}/runs`, z.array(workflowRunSchema)),
+    enabled: workflowId !== "",
     refetchInterval: (query) => {
       if (!live) return false;
       const runs = query.state.data;

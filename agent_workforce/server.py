@@ -16,11 +16,11 @@ from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
 from . import automations
-from ..src.agent_workforce.routes import agents, automations as automations_routes, opportunities, plans, workflows, workspace
+from .routes import agents, automations as automations_routes, opportunities, plans, workflows, workspace
 
 app = FastAPI(title="Crew")
 
-STATIC_DIR = Path(__file__).parent / "static"
+STATIC_DIR = Path(__file__).parent.parent / "frontend" / "dist"
 
 app.include_router(agents.router)
 app.include_router(workflows.router)

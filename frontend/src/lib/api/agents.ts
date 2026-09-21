@@ -2,7 +2,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { z } from "zod";
 import { apiGet, apiPost } from "./client";
 import { agentSchema, agentDraftSchema, type AgentDraft } from "../schemas/agent";
-import { jobSchema } from "../schemas/job";
+import { jobSchema, jobEventSchema } from "../schemas/job";
 
 export function useAgents() {
   return useQuery({
@@ -12,14 +12,17 @@ export function useAgents() {
   });
 }
 
+const NON_TERMINAL_JOB_STATUSES = new Set(["pending", "running", "awaiting_approval"]);
+
 export function useAgentJobs(agentId: string, { live = false }: { live?: boolean } = {}) {
   return useQuery({
     queryKey: ["agents", agentId, "jobs"],
     queryFn: () => apiGet(`/agents/${agentId}/jobs`, z.array(jobSchema)),
+    enabled: agentId !== "",
     refetchInterval: (query) => {
       if (!live) return false;
       const jobs = query.state.data;
-      const hasActiveJob = jobs?.some((j) => j.status === "running" || j.status === "pending");
+      const hasActiveJob = jobs?.some((j) => NON_TERMINAL_JOB_STATUSES.has(j.status));
       return hasActiveJob ? 1000 : false;
     },
   });
@@ -50,10 +53,12 @@ export function useProposeAgent() {
 
 export type { AgentDraft };
 
+const assignTaskResponseSchema = z.object({ job_id: z.string(), status: z.string() });
+
 export function useAssignTask(agentId: string) {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: (body: { input: string }) => apiPost(`/agents/${agentId}/tasks`, jobSchema, body),
+    mutationFn: (body: { input: string }) => apiPost(`/agents/${agentId}/tasks`, assignTaskResponseSchema, body),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["agents"] });
       queryClient.invalidateQueries({ queryKey: ["agents", agentId, "jobs"] });
@@ -88,8 +93,6 @@ export function useRejectJob() {
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["agents"] }),
   });
 }
-
-const jobEventSchema = z.object({ id: z.string(), job_id: z.string(), label: z.string(), created_at: z.number() });
 
 export function useJobTimeline(jobId: string | null) {
   return useQuery({

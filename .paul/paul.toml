@@ -1,0 +1,34 @@
+name = "agent_workforce"
+version = "0.2.0"
+status = "active"
+path = "."
+tags = []
+
+[paul]
+version = "1.4.0"
+source = "https://chrisai.cv/skool"
+
+[milestone]
+name = "v0.2 Revenue Connectors"
+version = "0.2.0"
+status = "in_progress"
+phases = 3
+
+[phase]
+number = 3
+name = "REST Connector Tool Calling"
+status = "planning"
+plans_completed = 0
+
+[loop]
+position = "PLAN"
+plan = "03-01"
+plan_path = "phases/03-rest-connector-tool-calling/03-01-PLAN.md"
+
+[satellite]
+groom = true
+
+[stats]
+total_plans = 1
+total_phases = 2
+last_activity = "2026-09-24T09:30:00"

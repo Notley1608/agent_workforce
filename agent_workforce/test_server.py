@@ -14,7 +14,7 @@ from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
-from . import automations, jobs, opportunities
+from . import automations, connectors, jobs, opportunities
 from . import db
 from . import providers
 from . import planner
@@ -1022,6 +1022,54 @@ class OpportunitiesTest(unittest.TestCase):
         resumed = client.post(f"/api/opportunities/{opp['id']}/status", json={"status": "executing"}).json()
         self.assertEqual(resumed["status"], "awaiting_approval")
         self.assertEqual(resumed["notes"], "need owner input on posting account")
+
+
+class ConnectorTest(unittest.TestCase):
+    def test_resolve_secrets_substitutes_placeholder_from_env(self):
+        with patch.dict("os.environ", {"MY_KEY": "sk-real-value"}):
+            headers, secrets = connectors.resolve_secrets({"Authorization": "Bearer ${MY_KEY}"}, "https://api.example.com")
+        self.assertEqual(headers["Authorization"], "Bearer sk-real-value")
+        self.assertEqual(secrets, ["sk-real-value"])
+
+    def test_resolve_secrets_refuses_placeholder_in_url(self):
+        with patch.dict("os.environ", {"MY_KEY": "sk-real-value"}):
+            with self.assertRaises(ValueError):
+                connectors.resolve_secrets({}, "https://api.example.com/${MY_KEY}")
+
+    def test_resolve_secrets_rejects_empty_env_var(self):
+        with patch.dict("os.environ", {"MY_KEY": ""}):
+            with self.assertRaises(ValueError):
+                connectors.resolve_secrets({"Authorization": "Bearer ${MY_KEY}"}, "https://api.example.com")
+
+    def test_redact_strips_secret_from_text(self):
+        text = connectors.redact("the key is sk-real-value here", ["sk-real-value"])
+        self.assertNotIn("sk-real-value", text)
+        self.assertIn("[REDACTED]", text)
+
+    def test_redact_handles_substring_secret_values(self):
+        text = connectors.redact("abc123 and abc", ["abc", "abc123"])
+        self.assertNotIn("abc123", text)
+        self.assertNotIn("abc", text)
+
+    def test_guard_ssrf_blocks_loopback(self):
+        with self.assertRaises(ValueError):
+            connectors.guard_ssrf("http://127.0.0.1/")
+
+    def test_guard_ssrf_blocks_link_local_metadata_address(self):
+        with self.assertRaises(ValueError):
+            connectors.guard_ssrf("http://169.254.169.254/")
+
+    def test_guard_ssrf_blocks_private_range(self):
+        with self.assertRaises(ValueError):
+            connectors.guard_ssrf("http://10.0.0.5/")
+
+    def test_guard_ssrf_blocks_unspecified_address(self):
+        with self.assertRaises(ValueError):
+            connectors.guard_ssrf("http://0.0.0.0/")
+
+    def test_guard_ssrf_allows_public_target(self):
+        addresses = connectors.guard_ssrf("http://93.184.216.34/")
+        self.assertEqual(addresses, ["93.184.216.34"])
 
 
 if __name__ == "__main__":
